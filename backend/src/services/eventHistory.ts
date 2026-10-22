@@ -45,9 +45,9 @@ export function recordEvent(
   amount?: number,
   metadata?: Record<string, any>,
   ledgerSequence?: number,
-): void {
+): boolean {
   const db = getDb();
-  recordEventWithDb(db, streamId, eventType, timestamp, actor, amount, metadata, ledgerSequence);
+  return recordEventWithDb(db, streamId, eventType, timestamp, actor, amount, metadata, ledgerSequence);
 }
 
 /**
@@ -55,9 +55,13 @@ export function recordEvent(
  * Uses INSERT OR IGNORE so duplicate (stream_id, event_type, ledger_sequence)
  * rows are silently skipped — safe to call on indexer restart.
  *
- * Consistency rule: when this is called with a transaction handle, the event
- * is committed or rolled back together with the stream row write. Callers must
- * not report success until the enclosing transaction commits.
+ * Consistency rule:
+ * - When called with a transaction handle, the event is committed or rolled
+ *   back together with the stream row write. Callers must not report success
+ *   until the enclosing transaction commits.
+ * - Returned results reflect committed state on success and do not claim a
+ *   change after failure: returns `true` if a row was actually inserted into
+ *   `stream_events`, or `false` if ignored due to conflict or deduplication.
  */
 export function recordEventWithDb(
   db: any,
@@ -68,8 +72,8 @@ export function recordEventWithDb(
   amount?: number,
   metadata?: Record<string, any>,
   ledgerSequence?: number,
-): void {
-  db.prepare(
+): boolean {
+  const result = db.prepare(
     `INSERT OR IGNORE INTO stream_events (stream_id, event_type, ledger_sequence, timestamp, actor, amount, metadata)
      VALUES (@streamId, @eventType, @ledgerSequence, @timestamp, @actor, @amount, @metadata)`,
   ).run({
@@ -83,6 +87,7 @@ export function recordEventWithDb(
       ? JSON.stringify(metadata, (_, v) => (typeof v === "bigint" ? v.toString() : v))
       : null,
   });
+  return (result?.changes ?? 0) > 0;
 }
 
 export function getStreamHistory(streamId: string, limit = 20, offset = 0, order: 'asc' | 'desc' = 'desc'): StreamEvent[] {

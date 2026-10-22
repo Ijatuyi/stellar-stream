@@ -613,6 +613,16 @@ async function indexEventsWithFallback(db: any, currentLedger: number, currentPo
       indexerEventsDedupedTotal.inc();
     }
   }
+  db.transaction(() => {
+    for (const event of events.events || []) {
+      const result = processEvent(db, event);
+      if (result === "inserted") insertedCount++;
+      else if (result === "deduped") dedupedCount++;
+    }
+  })();
+  if (insertedCount > 0) eventsIndexedTotal.inc(insertedCount);
+  if (dedupedCount > 0) indexerEventsDedupedTotal.inc(dedupedCount);
+}
 
   saveCheckpoint(db, currentLedger);
   lastProcessedLedger = currentLedger;
@@ -694,6 +704,9 @@ async function indexEventsWithCursorPagination(db: any, currentLedger: number, c
 
     const events = eventsResponse.events ?? [];
     const nextCursor = eventsResponse.cursor;
+    if (nextCursor && nextCursor === cursor) {
+  throw new Error("indexer: RPC returned the same cursor again (replayed page)");
+}
 
     if (events.length === 0) {
       if (!nextCursor) {
@@ -736,6 +749,19 @@ async function indexEventsWithCursorPagination(db: any, currentLedger: number, c
 
     totalInserted += pageInserted;
     totalDeduped += pageDeduped;
+  for (const event of events) {
+    const result = processEvent(db, event);
+    if (result === "inserted") pageInserted++;
+    else if (result === "deduped") pageDeduped++;
+
+    if (event.ledger > maxLedgerSeen) {
+      maxLedgerSeen = event.ledger;
+    }
+  }
+})();
+
+if (pageInserted > 0) eventsIndexedTotal.inc(pageInserted);
+if (pageDeduped > 0) indexerEventsDedupedTotal.inc(pageDeduped);
 
     if (pageDeduped > 0) {
       logger.info(
@@ -825,6 +851,63 @@ export function processEvent(db: any, event: rpc.Api.EventResponse): ProcessEven
           },
           event.ledger,
         );
+type ProcessResult = "inserted" | "deduped" | "skipped";
+
+function processEvent(db: any, event: rpc.Api.EventResponse): ProcessResult {
+  const topic = event.topic.map((t: any) => scValToNative(t));
+  const value = scValToNative(event.value);
+
+  if (topic.length < 2) return "skipped";
+  if (topic[0] !== "Stream") return "skipped";
+
+  const eventName = topic[1];
+  const timestamp = Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000);
+  const streamId = value.stream_id.toString();
+
+  switch (eventName) {
+    case "Created":
+      return recordEventWithDb(db, streamId, "created", timestamp,
+        value.actor ?? value.sender, value.total_amount,
+        { recipient: value.recipient, token: value.token, startTime: value.start_time, endTime: value.end_time },
+        event.ledger);
+
+    case "Claimed":
+      return recordEventWithDb(db, streamId, "claimed", timestamp,
+        value.actor ?? value.recipient, value.amount,
+        { claimed_amount: value.claimed_amount }, event.ledger);
+
+    case "Completed":
+      return recordEventWithDb(db, streamId, "completed", timestamp,
+        value.actor, value.total_amount, undefined, event.ledger);
+
+    case "Canceled":
+      return recordEventWithDb(db, streamId, "canceled", timestamp,
+        value.actor ?? value.sender, value.refunded_amount, undefined, event.ledger);
+
+    case "Paused":
+      return recordEventWithDb(db, streamId, "paused", timestamp,
+        value.actor ?? value.sender, undefined,
+        { paused_at: value.paused_at }, event.ledger);
+
+    case "Resumed":
+      return recordEventWithDb(db, streamId, "resumed", timestamp,
+        value.actor ?? value.sender, undefined,
+        { resumed_at: value.resumed_at }, event.ledger);
+
+    case "Transfer":
+      return recordEventWithDb(db, streamId, "transferred", timestamp,
+        value.actor ?? value.old_recipient, undefined,
+        { new_recipient: value.new_recipient }, event.ledger);
+
+    case "Clawback":
+      return recordEventWithDb(db, streamId, "clawback", timestamp,
+        value.actor, value.amount, { recipient: value.recipient }, event.ledger);
+
+    default:
+      logger.warn({ eventName }, "unknown contract event type — skipped");
+      return "skipped";
+  }
+}
         break;
 
       case "Claimed":
